@@ -47,7 +47,7 @@ A single peer can be a consumer for some requests and a producer for others at t
 The transfer itself is best-effort and asynchronous. The consumer sends the producer the block hashes it needs; the producer matches them against its local CPU cache and answers with the hits; the consumer allocates CPU slots for the hits and the producer pushes the blocks over NIXL. Hits load into the GPU as normal cache hits; misses are recomputed by the engine, so a partial or failed transfer degrades to today's behavior rather than failing the request.
 
 ![Architecture: the EPP picks the destination pod and source peer and sends the consumer a KV-cache-source header; the consumer's routing sidecar injects the P2P transfer params; a ZMQ control exchange carries block hashes and matches between the pods; NIXL moves the matched blocks from the producer's CPU offload tier to the consumer's CPU tier without touching either GPU; hits load into the consumer's GPU KV cache and unmatched blocks fall back to a recompute](../static/img/blogs/p2p-kv-cache/architecture.png)
-*The EPP selects both the destination pod and the source peer, and passes the decision to the consumer as a header. The routing sidecar injects the transfer params into the request; the consumer's offloading connector then opens a peer session and does the work engine to engine - a ZMQ control exchange settles which blocks the peer holds, and NIXL moves those blocks CPU-tier to CPU-tier (neither GPU is touched). Hits load into the consumer's GPU as normal cache hits, and any unmatched blocks recompute, so a partial or failed transfer degrades to today's behavior.*
+*The EPP picks destination and source and passes the decision as a header; the sidecar injects the transfer params, and the engines do the rest peer to peer - ZMQ settles which blocks the source holds, NIXL moves them CPU-tier to CPU-tier, and unmatched blocks recompute.*
 
 ## How llm-d Decides When to Pull
 
@@ -92,19 +92,13 @@ reproducible the same way the other llm-d guides' benchmarks are.
 {/* Setup: kermit/CoreWeave, vLLM nightly + P2P connector branch +
 robustness fixes; full tables in the p2p-findings RESULTS.md. */}
 
-Two deployment prerequisites apply to every P2P configuration. First,
-block hashes must agree across the fleet: vLLM seeds them per process, so
-all peers need the same `PYTHONHASHSEED` and an identical `--block-size`.
-Without either, hashes never match across pods and P2P silently degrades
-to zero matches - the protocol runs, but every lookup misses and every
-prefix is recomputed locally. The external prefix cache hit rate metric is
-the quickest way to catch this: it stays at zero. Second, the CPU offload
-tier peers serve from must be considerably larger than the pod's GPU KV
-cache (we run 2x) - its value is the KV that GPU evicts and CPU retains.
-Compute that ratio from the engine's reported KV capacity rather than
-per-GPU intuition: weights are paid once per pod while KV memory scales
-with the tensor-parallel degree, so a tier that doubles the GPU cache at
-TP=1 can be a fraction of it at TP=4.
+Two deployment prerequisites apply everywhere: block hashes must agree
+across the fleet (same `PYTHONHASHSEED`, identical `--block-size` -
+otherwise every lookup silently misses, visible as a zero external
+prefix cache hit rate), and the CPU offload tier must be considerably
+larger than the pod's *measured* GPU KV cache (we run 2x; KV memory
+scales with the tensor-parallel degree, so compute the ratio per role).
+The guide covers both in full.
 
 ### Pull versus recompute (single request)
 
@@ -123,13 +117,10 @@ fresh prefix seeded on one pod, measured on a cold pod, 5-rep medians:
 The pull wins at every measured length and the gap grows with the prefix:
 at 48K - a large document - the pull delivers the prefix 3x faster than
 gpt-oss's fast MoE prefill (~29K tokens/s) can recompute it. The
-measurement is a single source-consumer pod pair, so it is independent of
-fleet size. The small-model testbed shows the same scaling: on Llama-8B
-the lines cross near 2K tokens (below it recompute wins, +11% at 1K) and
-the pull leads -69% at 16K; on gpt-oss the pull already wins at 2K because
-its KV is compact (41.5 KB/token) relative to its prefill speed. Where the
-lines cross depends on the model's KV-size-to-prefill-speed ratio; the
-economics are a property of the mechanism. The router's 2048-token pull
+measurement is a single source-consumer pod pair, independent of fleet
+size. The small-model testbed shows the same scaling - on Llama-8B the
+lines cross near 2K tokens and the pull leads -69% at 16K - and where
+they cross is a property of the model's KV-size-to-prefill-speed ratio. The router's 2048-token pull
 threshold - the minimum extra cached-prefix tokens a peer must hold beyond
 the scheduled pod before a pull is requested - is set to the smallest
 length at which the pull wins on both models.
@@ -169,66 +160,38 @@ Medians are equal - a session answering from its warm cache is fast either
 way. The separation is in the tails and the variance: **p99 TTFT of 21-27s
 with P2P versus 37-81s with prefix-first routing - a 28-74% reduction, up
 to 3.9x lower - alongside up to +17% throughput and a 10% run-to-run spread
-versus 28%**. The mechanism: prefix-first placement sends every
-question to the pod that owns its document, and under contention the queue
-on that pod becomes the p99 - while displaced questions recompute 48K
-tokens. Load-aware placement sends the question wherever there is
-capacity, and the pull makes the resulting miss cost ~0.6s instead of a
-~2s recompute or a multi-second wait. The tier counters agree: the P2P arm
-moved 30-32M tokens between pods per run.
+versus 28%**. The mechanism: under contention, the document owner's queue becomes
+prefix-first placement's p99, while displaced questions recompute 48K
+tokens; load-aware placement sends questions wherever capacity exists and
+the pull prices the miss at ~0.6s instead of a ~2s recompute or a
+multi-second wait. The P2P arm moved 30-32M tokens between pods per run.
 
-The consistency across the two runs matters as much as the speed: the
-prefix-first arm's numbers swing with whatever cache state the fleet
-happens to inherit (the two runs deliberately alternate arm order, so each
-arm serves once from a cold fleet and once from one warmed by the other
-arm), while load-aware + P2P placement does not depend on where KV already
-lives - so its results moved little between these two runs. A stronger
-stability claim would want more repetitions; this is the behavior observed
-across the alternated pair.
+Consistency matters as much as speed: across the order-alternated pair,
+the prefix-first arm swings with inherited cache state (28% spread) while
+the P2P arm, which does not depend on where KV already lives, moves
+little (10%).
 
 The remaining scenarios run on the small-model testbed (4x Llama-3.1-8B) -
 the same mechanics at a scale that reruns on four GPUs.
 
-### One hot prefix: routing is the win, P2P is the enabler
-
-With a single hot 16K prefix ramped to 24 req/s, cache-affinity routing
-concentrates all requests on the prefix owner and saturates it (p50 latency
-6.1s at rate 24), while load-balanced routing keeps p50 at 0.53s - an 11x
-lower median latency. P2P adds nothing on top for a single persistent prefix
-(each pod recomputes it once and it stays resident); its role in this regime
-is to make load-balanced routing safe for prefixes that do not fit
-everywhere - the next scenario measures that at small scale, and the
-document Q&A benchmark above is the same effect at fleet scale.
-
-![Bar charts: one hot 16K prefix at 24 req/s; affinity sends all 5,040 requests to one pod, load-balanced routing spreads ~1,260 per pod and cuts p50 latency from 6.07 s to 0.53 s](../static/img/blogs/p2p-kv-cache/hotspot.png)
-*One hot 16K prefix at 24 req/s. Affinity sends all 5,040 requests to the
-prefix owner and saturates it; load-balanced routing spreads them evenly and
-cuts p50 latency 11x.*
-
 ### Shared-prefix pool: P2P makes load-balancing viable
 
-A shared-prefix pool: 64 distinct 16K-token system prompts (a 128 GiB KV
-pool - far more than any single pod caches), 256-token questions, 64 output
-tokens, constant-rate stages. Every request landing on a pod that does not
-hold its prefix must recompute 16K tokens (no P2P) or pull them from the
-holder (P2P). Same load-balanced routing in both arms; cache-affinity
-routing as the reference (64 uniformly popular prefixes spread evenly, so
-affinity balances well here - its best case).
+When a single hot prefix fits on every pod, load-balanced routing alone
+wins (11x lower median latency than saturating the prefix owner under
+affinity at 24 req/s) and P2P adds nothing - each pod recomputes the
+prefix once and it stays resident. The pull matters when prefixes do
+not fit everywhere, which this pool measures: 64 distinct 16K-token
+system prompts (a 128 GiB KV pool - far more than any single pod
+caches), 256-token questions, 64 output tokens, constant-rate stages.
+Every request landing on a pod that does not hold its prefix must
+recompute 16K tokens (no P2P) or pull them from the holder (P2P). Same
+load-balanced routing in both arms; cache-affinity routing as the
+reference (64 uniformly popular prefixes spread evenly - its best
+case).
 
-At moderate rates (2-8 req/s), successful-request latency, no-P2P versus
-P2P:
-
-| rate | no-P2P p50 / p95 | P2P p50 / p95 | P2P TTFT p50 vs no-P2P |
-|---|---|---|---|
-| 2 req/s | 0.94s / 2.38s | **0.93s / 1.65s** | 0.40s vs 0.57s |
-| 4 req/s | 1.12s / 2.76s | **0.93s / 2.14s** | 0.42s vs 0.57s |
-| 6 req/s | 1.53s / 4.62s | **1.07s / 2.62s** | 0.56s vs 0.59s |
-| 8 req/s | 2.49s / 6.41s | **1.41s / 3.72s** | 0.59s vs 0.79s |
-
-P2P wins at every rate and the gap grows with load: at 8 req/s, 43% lower
-p50 and 42% lower p95, with TTFT 5-30% lower across the measured rates
-(25% at 8 req/s) - the prefix arrives over the network instead of being
-recomputed.
+At moderate rates (2-8 req/s) P2P wins at every rate and the gap grows
+with load - at 8 req/s, 43% lower p50 and 42% lower p95 - because the
+prefix arrives over the network instead of being recomputed.
 
 ![Bar charts: p50 and p95 request latency at 2-8 req/s on the 64x16K pool; P2P lower at every rate, p95 3.72 s versus 6.41 s at 8 req/s](../static/img/blogs/p2p-kv-cache/pool-latency.png)
 *Successful-request latency on the pool workload, identical routing in both
@@ -248,13 +211,11 @@ case. With P2P, load-balanced routing holds:
 | 20 req/s | 10.1 req/s / 34.3s | **11.6 req/s / 24.6s** |
 | 24 req/s | 10.4 req/s / 44.1s | **11.3 req/s / 36.4s** |
 
-P2P raises the saturation ceiling by ~22% (12.6 versus 10.3 req/s achieved)
-and delivers up to 83% lower p50 in the 12-16 req/s band where no-P2P has
-already collapsed but P2P still keeps pace, with 30% higher peak token
-throughput (3,184 versus 2,420 tok/s). Both arms eventually saturate - the
-GPUs run out either way - but the pull path buys the fleet a fifth of extra
-capacity and a far gentler degradation curve on a workload whose working set
-no single pod can cache.
+P2P raises the saturation ceiling by ~22% (12.6 versus 10.3 req/s) with
+up to 83% lower p50 in the 12-16 req/s band and 30% higher peak token
+throughput. Both arms eventually saturate - the GPUs run out either way -
+but the pull buys a fifth of extra capacity and a gentler degradation
+curve on a working set no single pod can cache.
 
 ![Line charts: achieved rate and p50 latency versus offered rate for affinity, load-balanced without P2P, and load-balanced with P2P; without the pull throughput saturates at 10.3 req/s, with it 12.6](../static/img/blogs/p2p-kv-cache/saturation.png)
 *Left: achieved versus offered rate. Affinity tracks the offered line (its
@@ -357,14 +318,11 @@ crossover: below it, the transfer's fixed cost outweighs the recompute it
 saves, and the threshold keeps the scheduler from ever issuing a losing
 pull. The single-request sweep earlier in this post prices it for
 gpt-oss-120b and Llama-8B (both cross near or below 2K tokens, hence the
-2048 threshold on those testbeds). For a new model, a two-point check on
-a live pod pair takes minutes and gives the same answer: time a warm pull
-and a fresh recompute at a small and a large size, and the pull's fixed
-overhead and both per-token rates fall out. On Qwen3-30B-A3B that check
-gives a ~30 ms pull overhead, an 8K-token pull in 74 ms against roughly
-360 ms of steady-state recompute, and a crossover near 760 tokens - so
-the agentic testbed runs a 1024 threshold, and the pull's advantage
-widens from there with size, on histories that run 10-100K tokens.
+2048 threshold on those testbeds). For a new model, a two-point check on a live pod pair takes minutes:
+time a warm pull and a fresh recompute at a small and a large size, and
+the fixed overhead, both per-token rates, and the crossover fall out -
+on Qwen3-30B-A3B, a ~30 ms overhead and a crossover near 760 tokens,
+hence the agentic testbed's 1024 threshold.
 
 | model | crossover | threshold |
 |---|---|---|
@@ -411,14 +369,11 @@ prefill and decode at matched TP.
 
 P2P KV cache sharing turns llm-d's per-pod prefix caches into a fleet-wide resource. The EPP's existing per-request prefix knowledge picks the source, a single header carries the decision, and the connector moves the blocks peer to peer - best-effort, asynchronous, and off the request's failure path. It composes with prefix-aware routing (which minimizes how often a pull is needed), with P/D disaggregation (prefill workers pull prefixes too), and with the storage tier (which adds persistence and capacity beyond what peers hold).
 
-The measurements give a simple rule for when to reach for it. When the
-working set fits in the fleet's GPU caches, prefix-aware routing alone is
-the right tool - a local hit is free and nothing beats it. When long
-prefixes oversubscribe the cache - large documents, deep sessions, wide
-prefix pools - placement by cache location starts paying in queues and
-recomputes, and that is where load-aware placement plus the pull wins.
-The crossover measurement prices each miss; the document-Q&A benchmark
-above shows what that pricing compounds into at fleet scale, on the tail
-latencies users actually feel.
+The rule the measurements give: when the working set fits the fleet's
+GPU caches, prefix-aware routing alone is the right tool; when long
+prefixes oversubscribe it - large documents, deep sessions, wide prefix
+pools, agentic contexts - affinity starts paying in queues and
+recomputes, and the pull converts those into network transfers priced by
+the crossover.
 
 The agentic measurement above uses the guide's synthetic session shapes; the follow-up is real traces. In recorded Claude Code sessions (the [Weka trace corpus](https://www.semianalysis.com/) published by SemiAnalysis), over half of all model requests arrive through sub-agent bursts - a median of seven per group, 51 at p90 - each inheriting the parent session's context as a verbatim prefix, with no advance signal to the serving layer. A burst that spills across pods today recomputes that repository-scale prefix once per pod; with P2P, the pod that already holds the prefix becomes the source while the others pull the cached blocks instead of recomputing them. A follow-up post will replay these traces (inference-perf's `weka_trace_replay`) against a P2P-enabled deployment to measure that directly - sub-agent fan-out, session handoff, and think-time gaps included. {/* TODO: fix the corpus link to the exact trace release, and link the agentic-serving GLM post once published */}
