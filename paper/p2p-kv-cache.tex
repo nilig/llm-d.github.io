@@ -10,7 +10,7 @@
 \newcommand{\llmd}{llm-d}
 \newcommand{\code}[1]{\texttt{\small #1}}
 
-\title{\bf Peer-to-Peer KV-Cache Sharing for Disaggregated LLM Serving}
+\title{\bf Peer-to-Peer KV-Cache Sharing for Distributed LLM Serving}
 \author{
   Nili Guy \and Liran Schour \and (author list TBD)\\[2pt]
   \normalsize IBM Research
@@ -34,13 +34,17 @@ P/D disaggregation. We evaluate on three models and four workload
 families on H200 clusters. A single-request analysis shows the pull
 outperforming recomputation above a model-dependent crossover of
 300--900 tokens, with the advantage growing with prefix length ($-68\%$
-latency at 48K tokens). End to end, adding P2P to the \llmd{} P/D
-reference deployment is strictly beneficial at high load: on a
-document-Q\&A workload, median TTFT drops $10.3\times$ with $+40\%$
-throughput; on agentic session shapes (10--100K-token contexts,
-tool-call idle gaps), median TTFT drops $4.8\times$ with $+33\%$
-throughput, while tail latency is bounded in both arms by the
-irreducible cold prefill. We further show that placement policy, not
+latency at 48K tokens). End to end, the mechanism pays in both
+deployment modes. In aggregated serving, load-aware placement with the
+pull cuts document-Q\&A tail TTFT by 28--74\% (up to $3.9\times$)
+against prefix-affinity routing with up to $+17\%$ throughput, and
+makes load-balanced placement viable for oversubscribed prefix pools.
+Added to the \llmd{} P/D reference deployment, it is strictly
+beneficial at high load: median TTFT drops $10.3\times$ with $+40\%$
+throughput on document Q\&A, and $4.8\times$ with $+33\%$ throughput
+on agentic session shapes (10--100K-token contexts, tool-call idle
+gaps), while tail latency is bounded in both arms by the irreducible
+cold prefill. We further show that placement policy, not
 transfer capability, determines whether sharing pays: making the pull
 the primary data path (load-only placement) scatters cache mass and
 loses to prefix affinity at every load tested, whereas affinity
@@ -72,7 +76,8 @@ peer's cached advantage exceeds the transfer's break-even point.
 
 We report a measurement-driven evaluation: a single-request
 pull-versus-recompute analysis that prices the mechanism per model
-(\S\ref{sec:crossover}); paired end-to-end comparisons on the \llmd{}
+(\S\ref{sec:crossover}); fleet-level results in aggregated serving
+(\S\ref{sec:agg}); paired end-to-end comparisons on the \llmd{}
 P/D reference topology under document-Q\&A and agentic workloads
 (\S\ref{sec:e2e}); a mechanism study showing router-decided
 prefill$\leftarrow$decode transfers sustaining flat per-turn latency in
@@ -154,6 +159,43 @@ one power of two above their measured crossover
     \bottomrule
   \end{tabular}
 \end{table}
+
+\section{Fleet-Level Results: Aggregated Serving}
+\label{sec:agg}
+In aggregated serving every pod is a symmetric peer. We evaluate on
+14$\times$gpt-oss-120b (one H200 each, 88\,GiB CPU tier per pod) with
+the precise prefix index, and replicate mechanisms on
+4$\times$Llama-3.1-8B.
+
+\paragraph{Document Q\&A.} 192 distinct $\approx$49K-token documents,
+6 questions each, 128 conversations in flight --- a working set that
+oversubscribes the fleet's GPU caches, so placement decides between a
+cache hit, a recompute, and a queue. Two arms --- precise
+prefix-affinity routing versus load-aware placement with the pull ---
+with arm order alternated across two full runs (all four runs
+1{,}152/1{,}152, zero failures). Medians are equal: a session answering
+from its warm cache is fast either way. The arms separate on tails and
+stability: p99 TTFT 21--27\,s with the pull versus 37--81\,s under
+affinity --- a 28--74\% reduction, up to $3.9\times$ --- alongside up to
+$+17\%$ throughput and a 10\% run-to-run spread versus 28\%.
+Affinity concentrates each document's questions on its owner, whose
+queue becomes the p99 while displaced questions recompute 49K tokens;
+load-aware placement sends questions wherever capacity exists, and the
+pull prices the resulting miss at $\approx$0.6\,s instead of a
+$\approx$2\,s recompute or a multi-second wait. The P2P arm moved
+30--32M tokens between pods per run.
+
+\paragraph{Hot prefix and prefix pools.} With a single hot 16K prefix,
+load-balanced routing alone wins ($11\times$ lower median latency than
+affinity's owner-saturation at 24\,req/s); the pull adds nothing once
+the prefix is resident everywhere --- its role is to make load-balanced
+routing safe when prefixes do \emph{not} fit everywhere. A 64-prefix
+pool (128\,GiB of KV, far exceeding any pod's cache) measures exactly
+that: every off-owner arrival either recomputes 16K tokens or pulls
+them, and the pulled arm sustains rates the recompute arm cannot
+(saturating $\approx$10.4 versus 12.6\,req/s at the highest tested
+offered rate, with p50 latency an order of magnitude lower under
+overload).
 
 \section{End-to-End Results on the P/D Reference Topology}
 \label{sec:e2e}
