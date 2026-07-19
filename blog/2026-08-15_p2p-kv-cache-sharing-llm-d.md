@@ -158,8 +158,8 @@ errors and zero restarts. TTFT p50 / p95 / p99 in seconds, and throughput:
 |---|---|---|---|---|---|
 | Precise prefix routing | 1 | 4.1s | 41.0s | 80.5s | 5.98 turns/s |
 | Precise prefix routing | 2 (order reversed) | 4.2s | 17.3s | 37.2s | 7.66 turns/s |
-| Load-aware + P2P | 1 | 4.5s | 13.0s | 20.9s | 7.02 turns/s |
-| Load-aware + P2P | 2 (order reversed) | 3.9s | 12.5s | 26.7s | 7.76 turns/s |
+| Load-aware + P2P | 1 | 4.5s | **13.0s** | **20.9s** | **7.02 turns/s** |
+| Load-aware + P2P | 2 (order reversed) | 3.9s | **12.5s** | **26.7s** | **7.76 turns/s** |
 
 ![Bar charts: document Q&A TTFT percentiles and throughput across two order-alternated runs; medians equal, load-aware + P2P p99 21-27 s versus 37-81 s for precise routing, throughput up to +17%](../static/img/blogs/p2p-kv-cache/docqa.png)
 *192 documents x 48K tokens, 6 Q&A turns each, 128 concurrent. Medians are
@@ -220,10 +220,10 @@ P2P:
 
 | rate | no-P2P p50 / p95 | P2P p50 / p95 | P2P TTFT p50 vs no-P2P |
 |---|---|---|---|
-| 2 req/s | 0.94s / 2.38s | 0.93s / 1.65s | 0.40s vs 0.57s |
-| 4 req/s | 1.12s / 2.76s | 0.93s / 2.14s | 0.42s vs 0.57s |
-| 6 req/s | 1.53s / 4.62s | 1.07s / 2.62s | 0.56s vs 0.59s |
-| 8 req/s | 2.49s / 6.41s | 1.41s / 3.72s | 0.59s vs 0.79s |
+| 2 req/s | 0.94s / 2.38s | **0.93s / 1.65s** | 0.40s vs 0.57s |
+| 4 req/s | 1.12s / 2.76s | **0.93s / 2.14s** | 0.42s vs 0.57s |
+| 6 req/s | 1.53s / 4.62s | **1.07s / 2.62s** | 0.56s vs 0.59s |
+| 8 req/s | 2.49s / 6.41s | **1.41s / 3.72s** | 0.59s vs 0.79s |
 
 P2P wins at every rate and the gap grows with load: at 8 req/s, 43% lower
 p50 and 42% lower p95, with TTFT 5-30% lower across the measured rates
@@ -243,10 +243,10 @@ case. With P2P, load-balanced routing holds:
 
 | offered rate | no-P2P achieved / p50 lat | P2P achieved / p50 lat |
 |---|---|---|
-| 12 req/s | 9.9 req/s / 12.2s | 11.6 req/s / 2.1s |
-| 16 req/s | 10.3 req/s / 21.3s | 12.6 req/s / 7.8s |
-| 20 req/s | 10.1 req/s / 34.3s | 11.6 req/s / 24.6s |
-| 24 req/s | 10.4 req/s / 44.1s | 11.3 req/s / 36.4s |
+| 12 req/s | 9.9 req/s / 12.2s | **11.6 req/s / 2.1s** |
+| 16 req/s | 10.3 req/s / 21.3s | **12.6 req/s / 7.8s** |
+| 20 req/s | 10.1 req/s / 34.3s | **11.6 req/s / 24.6s** |
+| 24 req/s | 10.4 req/s / 44.1s | **11.3 req/s / 36.4s** |
 
 P2P raises the saturation ceiling by ~22% (12.6 versus 10.3 req/s achieved)
 and delivers up to 83% lower p50 in the 12-16 req/s band where no-P2P has
@@ -283,7 +283,7 @@ exactly as shipped, versus the same deployment plus the P2P stack
 | | P/D guide | P/D guide + P2P |
 |---|---|---|
 | TTFT p50 | 11.94 s | **1.16 s** |
-| TTFT p95 | 71.6 s | 55.2 s |
+| TTFT p95 | 71.6 s | **55.2 s** |
 | TTFT p99 | 106.1 s | **80.0 s** |
 | throughput | 5.68 turns/s | **7.96 turns/s** |
 
@@ -365,6 +365,22 @@ gives a ~30 ms pull overhead, an 8K-token pull in 74 ms against roughly
 360 ms of steady-state recompute, and a crossover near 760 tokens - so
 the agentic testbed runs a 1024 threshold, and the pull's advantage
 widens from there with size, on histories that run 10-100K tokens.
+
+| model | crossover | threshold |
+|---|---|---|
+| gpt-oss-120b | < 2,048 tokens | 2,048 |
+| Llama-3.1-8B | ~2,000 tokens | 2,048 |
+| Qwen3-30B-A3B | ~760 tokens | 1,024 |
+
+One deployment stance follows from every measurement in this post: the
+pull is a recovery path, not a placement strategy. Keep prefix-affinity
+placement as the primary policy - a local hit is free, and a pod's
+cache mass compounds turn over turn - and let the pull cover the
+divergence cases: queue-pressure spills, evictions across idle gaps,
+cold replicas, session migration. Inverting this (placing purely by
+load and pulling everywhere) scatters cache mass so no peer accumulates
+enough to serve from, and turns the transfer path into sustained
+bandwidth the fleet pays on every request.
 
 Sizing the tier that serves the pulls follows the same measure-first
 rule: read the engine's KV capacity from its startup log and provision
