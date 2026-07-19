@@ -330,15 +330,21 @@ hence the agentic testbed's 1024 threshold.
 | Llama-3.1-8B | ~2,000 tokens | 2,048 |
 | Qwen3-30B-A3B | ~760 tokens | 1,024 |
 
-One deployment stance follows from every measurement in this post: the
-pull is a recovery path, not a placement strategy. Keep prefix-affinity
-placement as the primary policy - a local hit is free, and a pod's
-cache mass compounds turn over turn - and let the pull cover the
-divergence cases: queue-pressure spills, evictions across idle gaps,
-cold replicas, session migration. Inverting this (placing purely by
-load and pulling everywhere) scatters cache mass so no peer accumulates
-enough to serve from, and turns the transfer path into sustained
-bandwidth the fleet pays on every request.
+One deployment stance follows from these measurements: the pull is a
+recovery path, not a placement strategy. Keep prefix-affinity placement
+as the primary policy - a local hit is free, and a pod's cache mass
+compounds turn over turn - and let the pull cover the divergence cases:
+queue-pressure spills, evictions across idle gaps, cold replicas,
+session migration. The one regime where placement itself should change
+is the one the document-Q&A headline measures: a working set that
+oversubscribes the fleet's GPU caches, where following the cache pays
+in queues and recomputes and load-aware placement plus the pull wins.
+Outside that regime, placing purely by load and pulling everywhere
+scatters cache mass so no peer accumulates enough to serve from, and
+turns the transfer path into sustained bandwidth the fleet pays on
+every request. The guide ships both configurations:
+`epp-affinity-p2p.yaml` is the recommended default, and
+`epp-load-p2p.yaml` is the oversubscribed-regime arm.
 
 Sizing the tier that serves the pulls follows the same measure-first
 rule: read the engine's KV capacity from its startup log and provision
