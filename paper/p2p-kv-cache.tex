@@ -313,9 +313,11 @@ re-render (gpt-oss, Qwen3-Thinking) expose only input context and
 re-prefilled history for pulling --- in the agentic workloads measured
 here, the bulk of the reuse. Text-append clients (as in common
 benchmark harnesses) cannot exercise generated-turn reuse for any
-model, because re-tokenized text diverges from generated IDs. KV block
-identity is tensor-parallel-dependent in the connector, so peers must
-run matched TP; and per-peer sessions are established lazily, so the
+model, because re-tokenized text diverges from generated IDs. TP-mismatched peers are supported only for non-hybrid-attention
+models on the V1 model runner (models defaulting to the V2 runner must
+be forced back via an environment variable); hybrid models such as
+gpt-oss require matched TP, and the topologies here run matched TP
+throughout. Finally, per-peer sessions are established lazily, so the
 first contact between a pair proceeds as a recompute unless sessions
 are pre-established.
 
